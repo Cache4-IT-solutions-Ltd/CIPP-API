@@ -51,6 +51,7 @@ function Invoke-AddUserDefaults {
         $Autopassword = $Request.Body.Autopassword
         $Password = $Request.Body.password
         $MustChangePass = $Request.Body.MustChangePass
+        $PerUserMfa = [System.Convert]::ToBoolean($Request.Body.perUserMfa)
 
         $UsageLocation = if ($Request.Body.usageLocation -is [string]) {
             $Request.Body.usageLocation
@@ -73,13 +74,13 @@ function Invoke-AddUserDefaults {
 
         # Contact fields
         $MobilePhone = $Request.Body.mobilePhone
-        $BusinessPhones = if ($null -ne $Request.Body.businessPhones) {
-            if ($Request.Body.businessPhones -is [array]) { $Request.Body.businessPhones[0] } else { $Request.Body.businessPhones }
-        } elseif ($null -ne $Request.Body.'businessPhones[0]') {
-            $Request.Body.'businessPhones[0]'
-        } else {
-            $null
-        }
+        $BusinessPhones = @(
+            if ($null -ne $Request.Body.businessPhones) {
+                $Request.Body.businessPhones | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            } elseif ($null -ne $Request.Body.'businessPhones[0]') {
+                $Request.Body.'businessPhones[0]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            }
+        )
         $OtherMails = $Request.Body.otherMails
 
         # User relations
@@ -89,6 +90,19 @@ function Invoke-AddUserDefaults {
 
         # Groups
         $GroupMemberships = if ($Request.Body.addToGroups) { $Request.Body.addToGroups } else { $Request.Body.groupMemberships }
+
+        # Shared calendars new users get an invitation to
+        $SharedCalendars = $Request.Body.sharedCalendars
+        $SharedCalendarPermission = if ($Request.Body.sharedCalendarPermission -is [string]) {
+            $Request.Body.sharedCalendarPermission
+        } else {
+            $Request.Body.sharedCalendarPermission.value
+        }
+
+        # Shared mailboxes new users get access to. The permission is a multi-select (Full Access and
+        # Send As are commonly granted together), so it is stored as posted.
+        $SharedMailboxes = $Request.Body.sharedMailboxes
+        $SharedMailboxPermission = $Request.Body.sharedMailboxPermission
 
         # Create template object with all fields from CippAddEditUser
         $TemplateObject = @{
@@ -106,6 +120,7 @@ function Invoke-AddUserDefaults {
             Autopassword             = $Autopassword
             password                 = $Password
             MustChangePass           = $MustChangePass
+            perUserMfa               = $PerUserMfa
             usageLocation            = $UsageLocation
             licenses                 = $Licenses
             removeLicenses           = $RemoveLicenses
@@ -124,6 +139,10 @@ function Invoke-AddUserDefaults {
             setSponsor               = $SetSponsor
             copyFrom                 = $CopyFrom
             groupMemberships         = $GroupMemberships
+            sharedCalendars          = $SharedCalendars
+            sharedCalendarPermission = $SharedCalendarPermission
+            sharedMailboxes          = $SharedMailboxes
+            sharedMailboxPermission  = $SharedMailboxPermission
         }
 
         # Use existing GUID if editing, otherwise generate new one

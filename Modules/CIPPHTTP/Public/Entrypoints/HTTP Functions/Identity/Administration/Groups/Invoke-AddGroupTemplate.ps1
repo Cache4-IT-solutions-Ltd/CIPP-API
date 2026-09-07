@@ -53,6 +53,8 @@ function Invoke-AddGroupTemplate {
             allowExternal   = $Request.Body.allowExternal
             username        = $Request.Body.username  # Can contain variables like @%tenantfilter%
             licenses        = $Request.Body.licenses
+            aliases         = $Request.Body.aliases # One per line, variables allowed
+            hideFromGAL     = $Request.Body.hideFromGAL
             GUID            = $GUID
         } | ConvertTo-Json -Depth 10
         $Table = Get-CippTable -tablename 'templates'
@@ -62,11 +64,11 @@ function Invoke-AddGroupTemplate {
             RowKey       = "$GUID"
             PartitionKey = 'GroupTemplate'
         }
-        Write-LogMessage -headers $Request.Headers -API $APINAME -message "Created Group template named $displayName with GUID $GUID" -Sev 'Debug'
+        Write-LogMessage -headers $Request.Headers -API $APINAME -tenant 'Global' -message "Created Group template named $displayName with GUID $GUID" -Sev 'Info'
 
         $body = [pscustomobject]@{'Results' = 'Successfully added template' }
     } catch {
-        Write-LogMessage -headers $Request.Headers -API $APINAME -message "Group Template Creation failed: $($_.Exception.Message)" -Sev 'Error'
+        Write-LogMessage -headers $Request.Headers -API $APINAME -tenant 'Global' -message "Group Template Creation failed: $($_.Exception.Message)" -Sev 'Error'
         $body = [pscustomobject]@{'Results' = "Group Template Creation failed: $($_.Exception.Message)" }
     }
 

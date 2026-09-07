@@ -2,6 +2,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -36,6 +38,127 @@ namespace CIPP
     }
 
     // =====================================================================
+    // CIPPConcurrentRequest / CIPPConcurrentResult
+    // =====================================================================
+    // One PowerShell call, many async HTTP requests. PowerShell builds the
+    // request list (and acquires any auth token once, passing it in Headers),
+    // then calls CIPPRestClient.SendConcurrent — the .NET side fans the requests
+    // out concurrently, bounded by a semaphore, with Retry-After / backoff on
+    // 429 and 5xx. This keeps concurrency in .NET (robust async) rather than
+    // ForEach-Object -Parallel runspaces in the PowerShell worker. Per-hostname
+    // connection caps (see the pool design above) still apply, so a burst to one
+    // host cannot exceed that host's connection budget.
+    // =====================================================================
+    public sealed class CIPPConcurrentRequest
+    {
+        public string                      Uri                { get; set; } = string.Empty;
+        public string                      Method             { get; set; } = "GET";
+        public string?                     Body               { get; set; }
+        public Dictionary<string, string>? Headers            { get; set; }
+        public string?                     ContentType        { get; set; }
+        public int                         TimeoutSec         { get; set; } = 100;
+        public int                         MaximumRedirection { get; set; } = -1;
+    }
+
+    /// <summary>
+    /// Per-request outcome, returned in the same order as the input requests.
+    /// A failed request never aborts the batch: transport failures land in
+    /// <see cref="Error"/>, HTTP responses (including 4xx/5xx after retries) land
+    /// in <see cref="Result"/>. Index maps back to the caller's request array.
+    /// </summary>
+    public sealed class CIPPConcurrentResult
+    {
+        public int         Index      { get; init; }
+        public bool        IsSuccess  { get; init; }
+        public int         StatusCode { get; init; }
+        public HttpResult? Result     { get; init; }
+        public string?     Error      { get; init; }
+        public int         Attempts   { get; init; }
+    }
+
+    // =====================================================================
+    // CIPPResponseHeaders / CIPPHttpResponse / CIPPHttpRequestException
+    // =====================================================================
+    // When a request returns a non-success status, the PowerShell wrapper
+    // (Invoke-CIPPRestMethod) throws a CIPPHttpRequestException. CIPP's Graph
+    // helpers were written against Invoke-RestMethod's HttpResponseException
+    // and read:
+    //     $_.Exception.Response.StatusCode -eq 429
+    //     $_.Exception.Response.Headers['Retry-After']
+    // The pooled client previously threw a bare HttpRequestException with no
+    // .Response, so those branches were dead. These types restore the expected
+    // shape: a .Response with a StatusCode (HttpStatusCode, so `-eq 429` works)
+    // and Headers that support case-insensitive string indexing returning a
+    // scalar value (so ['Retry-After'] works), matching the old behaviour.
+    // =====================================================================
+
+    /// <summary>
+    /// Case-insensitive response-header view exposed to PowerShell. The string
+    /// indexer returns the (comma-joined) value for a header, or null if absent,
+    /// mirroring how WebHeaderCollection / HttpResponseHeaders were consumed in
+    /// CIPP via $response.Headers['Header-Name'].
+    /// </summary>
+    public sealed class CIPPResponseHeaders
+    {
+        private readonly Dictionary<string, string[]> _headers;
+
+        public CIPPResponseHeaders(Dictionary<string, string[]>? headers)
+        {
+            _headers = headers is not null
+                ? new Dictionary<string, string[]>(headers, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>$resp.Headers['Retry-After'] -> scalar string (joined), or null.</summary>
+        public string? this[string key]
+            => key is not null && _headers.TryGetValue(key, out var v) ? string.Join(", ", v) : null;
+
+        public bool Contains(string key) => key is not null && _headers.ContainsKey(key);
+        public string[]? GetValues(string key) => key is not null && _headers.TryGetValue(key, out var v) ? v : null;
+        public IEnumerable<string> Keys => _headers.Keys;
+        public int Count => _headers.Count;
+    }
+
+    /// <summary>
+    /// Lightweight stand-in for the response object CIPP code reaches through
+    /// $_.Exception.Response. Carries the status code (as HttpStatusCode so
+    /// `-eq 429` works), the headers (string-indexable), and the raw body.
+    /// </summary>
+    public sealed class CIPPHttpResponse
+    {
+        public HttpStatusCode StatusCode { get; }
+        public int StatusCodeValue { get; }
+        public CIPPResponseHeaders Headers { get; }
+        public string Content { get; }
+
+        public CIPPHttpResponse(int statusCode, Dictionary<string, string[]>? headers, string? content)
+        {
+            StatusCode      = (HttpStatusCode)statusCode;
+            StatusCodeValue = statusCode;
+            Headers         = new CIPPResponseHeaders(headers);
+            Content         = content ?? string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// HttpRequestException subclass carrying a .Response (CIPPHttpResponse).
+    /// Subclassing keeps existing `catch [System.Net.Http.HttpRequestException]`
+    /// and `$_.Exception.Message` / `$_.ErrorDetails.Message` handling intact,
+    /// while restoring `$_.Exception.Response.StatusCode` /
+    /// `$_.Exception.Response.Headers['Retry-After']`.
+    /// </summary>
+    public sealed class CIPPHttpRequestException : HttpRequestException
+    {
+        public CIPPHttpResponse Response { get; }
+
+        public CIPPHttpRequestException(string message, int statusCode, Dictionary<string, string[]>? headers, string? content)
+            : base(message, null, (HttpStatusCode)statusCode)
+        {
+            Response = new CIPPHttpResponse(statusCode, headers, content);
+        }
+    }
+
+    // =====================================================================
     // CIPPRestClient
     // =====================================================================
     // Thread-safe, process-scoped HTTP client manager.
@@ -57,10 +180,11 @@ namespace CIPP
     //   AdminPlane      5   admin.microsoft.com, reports, Defender, etc.
     //   Compliance      5   compliance redirect discovery (no-redirect)
     //   PartnerCenter   5   api.partnercenter.microsoft.com
+    //   SPO             5   *.sharepoint.com CSOM/_api (concurrent per-site fan-out)
     //   DNS             2   dns.google.com, cloudflare-dns.com (per host)
     //   Default         5   catch-all + absorbs legacy Invoke-RestMethod calls
     //   ─────────────
-    //   Total          79   leaves a 46-port buffer for the Functions host,
+    //   Total          84   leaves a 41-port buffer for the Functions host,
     //                       Durable extension, AppInsights, Azure SDK clients,
     //                       and any stragglers that bypass the pool.
     //
@@ -112,6 +236,7 @@ namespace CIPP
         private static HttpClient? _complianceClient;
         private static HttpClient? _partnerCenterClient;
         private static HttpClient? _adminPlaneClient;
+        private static HttpClient? _spoClient;
         private static HttpClient? _dnsClient;
         private static HttpClient? _defaultClient;
 
@@ -268,6 +393,27 @@ namespace CIPP
         }) { Timeout = Timeout.InfiniteTimeSpan };
 
         /// <summary>
+        /// SharePoint / OneDrive client — dedicated lane for SPO admin CSOM (ProcessQuery) and
+        /// SPO REST (_api) against *.sharepoint.com, which have no server-side $batch. Concurrent
+        /// per-site writes (Set-CIPPSPOSiteBulk via SendConcurrent) fan out here. HTTP/2 is disabled
+        /// so MaxConnectionsPerServer is a true concurrency ceiling (5) rather than a connection count
+        /// that H2 stream-multiplexing could exceed. Measured on a 526-site tenant, 5 in flight throttled
+        /// far less than 8-10 (43 vs 56 x HTTP 429) and finished sooner — SPO's CSOM-admin throttle is a
+        /// sustained-rate limit, so a lower ceiling plus the once-per-24h sweep guard is the throttle-safe
+        /// combination. Cap: 5 connections.
+        /// </summary>
+        private static HttpClient BuildSpoClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = false,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = 5,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
         /// DNS client — dedicated lane for DoH (DNS-over-HTTPS) providers.
         /// Covers dns.google.com and cloudflare-dns.com. These services
         /// heavily load-balance across many server IPs, so a low per-server
@@ -321,6 +467,7 @@ namespace CIPP
                 _complianceClient is not null &&
                 _partnerCenterClient is not null &&
                 _adminPlaneClient is not null &&
+                _spoClient        is not null &&
                 _dnsClient        is not null &&
                 _defaultClient    is not null)
                 return;
@@ -337,6 +484,7 @@ namespace CIPP
                     _complianceClient = BuildComplianceClient();
                     _partnerCenterClient = BuildPartnerCenterClient();
                     _adminPlaneClient = BuildAdminPlaneClient();
+                    _spoClient        = BuildSpoClient();
                     _dnsClient        = BuildDnsClient();
                     _defaultClient    = BuildDefaultClient();
                 }
@@ -421,6 +569,12 @@ namespace CIPP
 
                 // Rule 6 — Microsoft admin/reporting/security lanes
                 var h when IsAdminPlaneHost(h)                             => (_adminPlaneClient!, "AdminPlane", host),
+
+                // Rule 6b — SharePoint / OneDrive (CSOM ProcessQuery + _api REST). Covers the
+                // tenant, -admin and -my hosts. No server-side $batch, so concurrent per-site
+                // requests fan out here, capped at 10 connections.
+                var h when h.EndsWith(".sharepoint.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_spoClient!, "SPO", host),
 
                 // Rule 7 — DNS-over-HTTPS providers (low connection cap)
                 var h when h.Equals("dns.google.com",
@@ -598,7 +752,33 @@ namespace CIPP
             HttpResponseMessage response;
             try
             {
-                response = await client.SendAsync(request, token).ConfigureAwait(false);
+                // ResponseHeadersRead: do NOT buffer the body inside SendAsync. With the
+                // default (ResponseContentRead) the body is downloaded and auto-decompressed
+                // here, so a mislabeled Content-Encoding (EXO error responses declare gzip on
+                // a plain body) throws InvalidDataException from SendAsync and bypasses the
+                // defensive body read below — masking the HTTP status the caller needs.
+                response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cts is not null && cts.IsCancellationRequested)
+            {
+                // Our per-request timeout CTS actually fired — this is a genuine
+                // client-side timeout after timeoutSec. Let it propagate as an
+                // OperationCanceledException so the PowerShell wrapper reports it
+                // as a timeout (and the "timed out after {timeoutSec}s" message is true).
+                TrackTransportError(selection.Pool);
+                throw;
+            }
+            catch (OperationCanceledException ex)
+            {
+                // Cancellation was NOT triggered by our timeout token. The server
+                // reset/closed the request before our timeout elapsed — common for
+                // slow EXO InvokeCommand cmdlets (Search-UnifiedAuditLog,
+                // Get-MessageTraceV2) which the service cuts off well under 100s.
+                // Surface it as a transport error so it is not mislabeled as a
+                // client timeout and is correctly treated as a retryable failure.
+                TrackTransportError(selection.Pool);
+                throw new HttpRequestException(
+                    $"The request to '{uri}' was canceled by the server before completing.", ex);
             }
             catch
             {
@@ -609,9 +789,33 @@ namespace CIPP
             using (response)
             {
                 var statusCode = (int)response.StatusCode;
-                var content    = response.Content is not null
-                    ? await response.Content.ReadAsStringAsync(token).ConfigureAwait(false)
-                    : string.Empty;
+
+                // Read the body defensively. With AutomaticDecompression enabled, ReadAsStringAsync can throw
+                // (InvalidDataException "...unsupported compression method", IOException, ...) when a response
+                // carries a Content-Encoding the handler cannot decode or a malformed/mislabeled body. Such a
+                // read failure must NOT mask the HTTP status: for an error response we surface the status code
+                // (the actionable signal - e.g. a 403 from EXO), and for a success response we surface a clear,
+                // attributable error instead of an opaque decompression exception. Callers that skip the error
+                // check (e.g. redirect / compliance-URL discovery) keep their headers and fall back to an empty body.
+                string content;
+                try
+                {
+                    content = response.Content is not null
+                        ? await ReadDecodedContentAsync(response.Content, token).ConfigureAwait(false)
+                        : string.Empty;
+                }
+                catch (Exception ex) when (ex is InvalidDataException || ex is IOException)
+                {
+                    if (!(skipErrorCheck || noRedirect))
+                    {
+                        TrackPoolResult(selection.Pool, response.IsSuccessStatusCode, statusCode);
+                        var readFailMessage = !response.IsSuccessStatusCode
+                            ? $"Response status code does not indicate success: {statusCode}"
+                            : $"Failed to read response body (status {statusCode}): {ex.Message}";
+                        throw new HttpRequestException(readFailMessage, ex, response.StatusCode);
+                    }
+                    content = string.Empty;
+                }
 
             // ----------------------------------------------------------
             // Response headers
@@ -664,6 +868,152 @@ namespace CIPP
                     ResponseHeaders = allHeaders,
                 };
             }
+        }
+
+        // -----------------------------------------------------------------
+        // Concurrent fan-out — one PowerShell call, many async requests
+        // -----------------------------------------------------------------
+        // PowerShell passes a list of requests (each already carrying its auth
+        // header) and gets back one result per request, in order. Concurrency is
+        // bounded by maxConcurrency here AND by each destination's
+        // MaxConnectionsPerServer cap, whichever is tighter. 429/5xx are retried
+        // with Retry-After (when present) or exponential backoff with jitter. A
+        // single request's failure is captured, never thrown, so the batch always
+        // completes and the caller can act on partial success.
+        //
+        // Synchronous shim for PowerShell (cannot await Tasks natively). Safe here
+        // for the same reason Send() is — no SynchronizationContext to deadlock on.
+        // -----------------------------------------------------------------
+        public static CIPPConcurrentResult[] SendConcurrent(
+            IEnumerable<CIPPConcurrentRequest> requests,
+            int maxConcurrency = 8,
+            int maxRetries     = 3)
+        {
+            return SendConcurrentAsync(requests, maxConcurrency, maxRetries)
+                   .GetAwaiter().GetResult();
+        }
+
+        public static async Task<CIPPConcurrentResult[]> SendConcurrentAsync(
+            IEnumerable<CIPPConcurrentRequest> requests,
+            int maxConcurrency = 8,
+            int maxRetries     = 3)
+        {
+            var list = requests is null ? new List<CIPPConcurrentRequest>() : requests.ToList();
+            if (list.Count == 0) return Array.Empty<CIPPConcurrentResult>();
+            if (maxConcurrency < 1) maxConcurrency = 1;
+            if (maxRetries    < 0) maxRetries     = 0;
+
+            using var gate = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+            var tasks = new Task<CIPPConcurrentResult>[list.Count];
+            for (int i = 0; i < list.Count; i++)
+            {
+                int index = i;
+                var req   = list[i];
+                tasks[i] = Task.Run(async () =>
+                {
+                    await gate.WaitAsync().ConfigureAwait(false);
+                    try   { return await SendOneWithRetryAsync(index, req, maxRetries).ConfigureAwait(false); }
+                    finally { gate.Release(); }
+                });
+            }
+            return await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+
+        private static async Task<CIPPConcurrentResult> SendOneWithRetryAsync(
+            int index, CIPPConcurrentRequest req, int maxRetries)
+        {
+            var attempt = 0;
+            while (true)
+            {
+                attempt++;
+                try
+                {
+                    // skipErrorCheck: 429/5xx must come back as results (not thrown) so we can
+                    // decide whether to retry; the caller inspects StatusCode/Content itself.
+                    var res = await SendAsync(req.Uri, req.Method, req.Body, req.Headers,
+                                              req.ContentType, skipErrorCheck: true,
+                                              timeoutSec: req.TimeoutSec,
+                                              maximumRedirection: req.MaximumRedirection).ConfigureAwait(false);
+
+                    var retryable = res.StatusCode == 429 || (res.StatusCode >= 500 && res.StatusCode <= 599);
+                    if (retryable && attempt <= maxRetries)
+                    {
+                        await Task.Delay(RetryDelay(res, attempt)).ConfigureAwait(false);
+                        continue;
+                    }
+                    return new CIPPConcurrentResult
+                    {
+                        Index = index, IsSuccess = res.IsSuccess, StatusCode = res.StatusCode,
+                        Result = res, Attempts = attempt,
+                    };
+                }
+                catch (Exception ex)
+                {
+                    if (attempt <= maxRetries)
+                    {
+                        await Task.Delay(RetryDelay(null, attempt)).ConfigureAwait(false);
+                        continue;
+                    }
+                    return new CIPPConcurrentResult
+                    {
+                        Index = index, IsSuccess = false, StatusCode = 0,
+                        Error = ex.Message, Attempts = attempt,
+                    };
+                }
+            }
+        }
+
+        private static TimeSpan RetryDelay(HttpResult? res, int attempt)
+        {
+            // Honour a sane Retry-After (seconds) when the server sends one.
+            if (res is not null &&
+                res.ResponseHeaders.TryGetValue("Retry-After", out var ra) &&
+                ra.Length > 0 && int.TryParse(ra[0], out var secs) && secs > 0 && secs <= 300)
+                return TimeSpan.FromSeconds(secs);
+
+            // Otherwise exponential backoff (1s, 2s, 4s, capped 8s) with jitter.
+            var baseMs = Math.Min(8000, 1000 * (int)Math.Pow(2, attempt - 1));
+            return TimeSpan.FromMilliseconds(baseMs + Random.Shared.Next(0, 1000));
+        }
+
+        // -----------------------------------------------------------------
+        // Content decoding
+        // -----------------------------------------------------------------
+        // Reads the response body as a string, decompressing explicitly based on
+        // the Content-Encoding header. SocketsHttpHandler.AutomaticDecompression
+        // normally handles this transparently AND strips Content-Encoding, in
+        // which case ContentEncoding is empty here and we just read the string.
+        // But AutomaticDecompression silently no-ops whenever a request carries a
+        // caller-supplied Accept-Encoding header (HttpClient assumes the caller
+        // will decode), and some endpoints (e.g. the Teams ConfigAPI) return gzip
+        // even when unprompted. When Content-Encoding survives, we decode it here
+        // so callers never receive raw compressed bytes. Idempotent: if the
+        // handler already decoded, there's nothing left to do.
+        // -----------------------------------------------------------------
+        private static async Task<string> ReadDecodedContentAsync(HttpContent httpContent, CancellationToken token)
+        {
+            var encodings = httpContent.Headers.ContentEncoding;
+            if (encodings is null || encodings.Count == 0)
+                return await httpContent.ReadAsStringAsync(token).ConfigureAwait(false);
+
+            var raw = await httpContent.ReadAsStreamAsync(token).ConfigureAwait(false);
+            Stream decoded = raw;
+            // Content-Encoding lists encodings in the order applied; decode in reverse.
+            foreach (var enc in encodings.Reverse())
+            {
+                decoded = enc?.Trim().ToLowerInvariant() switch
+                {
+                    "gzip" or "x-gzip" => new GZipStream(decoded, CompressionMode.Decompress),
+                    "deflate"          => new DeflateStream(decoded, CompressionMode.Decompress),
+                    "br"               => new BrotliStream(decoded, CompressionMode.Decompress),
+                    "identity" or "" or null => decoded,
+                    _                  => decoded,
+                };
+            }
+            using var reader = new StreamReader(decoded, Encoding.UTF8);
+            var result = await reader.ReadToEndAsync(token).ConfigureAwait(false);
+            decoded.Dispose();
+            return result;
         }
 
         // =================================================================
@@ -872,6 +1222,56 @@ namespace CIPP
 
             if (_entries.TryRemove(key, out _))
                 Interlocked.Increment(ref _invalidations);
+        }
+
+        /// <summary>
+        /// Invalidate every cached token for a tenant, across all scopes, client IDs and
+        /// grant types. Call this after a consent change (CPV refresh/reset, permission
+        /// update) so the next request re-acquires a token carrying the new scopes instead
+        /// of serving a stale one that predates the consent.
+        /// Keys are built as "tenantId|scope|app-or-delegated|clientId|grantType", so the
+        /// tenant is matched on the first segment.
+        /// </summary>
+        public static int RemoveByTenant(string tenantId)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                return 0;
+
+            var prefix = tenantId.Trim().ToLowerInvariant() + "|";
+            var removed = 0;
+
+            foreach (var kvp in _entries)
+            {
+                if (kvp.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                    _entries.TryRemove(kvp.Key, out _))
+                {
+                    removed++;
+                    Interlocked.Increment(ref _invalidations);
+                }
+            }
+
+            return removed;
+        }
+
+        /// <summary>
+        /// Invalidate the entire token cache. Intended for global consent/app changes
+        /// (for example rotating the SAM application) where per-tenant invalidation is
+        /// not sufficient.
+        /// </summary>
+        public static int Clear()
+        {
+            var removed = 0;
+
+            foreach (var kvp in _entries)
+            {
+                if (_entries.TryRemove(kvp.Key, out _))
+                {
+                    removed++;
+                    Interlocked.Increment(ref _invalidations);
+                }
+            }
+
+            return removed;
         }
 
         public static int CompactExpired(int refreshSkewSeconds = 0, int maxRemovals = 1000)

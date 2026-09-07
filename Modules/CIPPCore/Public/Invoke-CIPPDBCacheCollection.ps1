@@ -9,12 +9,14 @@ function Invoke-CIPPDBCacheCollection {
         compared to individual per-type activities, eliminating replay overhead.
 
         Collection types map to license categories:
-        - Graph:              Core tenant data (no special license needed)
-        - ExchangeConfig:     Exchange Online policy/config data
-        - ExchangeData:       Mailboxes, CAS mailboxes, usage reports
-        - ConditionalAccess:  CA policies and registration details
-        - IdentityProtection: Risky users/SPs, risk detections, PIM
-        - Intune:             Managed devices, policies, app protection
+        - Graph:                Core tenant data (no special license needed)
+        - ExchangeConfig:       Exchange Online policy/config data
+        - ExchangeData:         Mailboxes, CAS mailboxes, usage reports
+        - ConditionalAccess:    CA policies and registration details
+        - IdentityProtection:   Risky users/SPs, risk detections, PIM
+        - Intune:               Managed devices, policies, app protection
+        - DefenderForOffice365: Safe Links/Attachments, ATP, Teams protection (MDO P1/P2)
+        - Defender:             Defender for Endpoint vulnerabilities (TVM/CVE)
 
     .PARAMETER CollectionType
         The group of cache functions to execute
@@ -31,7 +33,7 @@ function Invoke-CIPPDBCacheCollection {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('Graph', 'ExchangeConfig', 'ExchangeData', 'ConditionalAccess', 'IdentityProtection', 'Intune', 'Compliance', 'CopilotUsage', 'SharePoint', 'Teams')]
+        [ValidateSet('Graph', 'ExchangeConfig', 'ExchangeData', 'ConditionalAccess', 'IdentityProtection', 'Intune', 'Compliance', 'CopilotUsage', 'SharePoint', 'Teams', 'DefenderForOffice365', 'Defender')]
         [string]$CollectionType,
 
         [Parameter(Mandatory = $true)]
@@ -54,6 +56,7 @@ function Invoke-CIPPDBCacheCollection {
             'AdminConsentRequestPolicy'
             'AuthorizationPolicy'
             'AuthenticationMethodsPolicy'
+            'SecurityDefaults'
             'DeviceSettings'
             'DirectoryRecommendations'
             'CrossTenantAccessPolicy'
@@ -67,20 +70,32 @@ function Invoke-CIPPDBCacheCollection {
             'OAuth2PermissionGrants'
             'AppRoleAssignments'
             'LicenseOverview'
+            'ActiveUserDetail'
             'BitlockerKeys'
+            'AdminReportSettings'
+            'PeopleInsights'
+            'Pronouns'
+            'NamePronunciation'
+            'PhotoUpdateSettings'
+            'OrganizationBranding'
+            'HomeRealmDiscoveryPolicy'
+            'MobileDeviceManagementPolicies'
+            'PermissionGrantPolicies'
+            'CopilotAdminSettings'
+            'CopilotPolicySettings'
+            'SelfServicePurchaseProducts'
+            'MoeraDmarc'
+            'DomainAnalyser'
         )
         ExchangeConfig     = @(
             'ExoAntiPhishPolicies'
             'ExoMalwareFilterPolicies'
-            'ExoSafeLinksPolicies'
-            'ExoSafeAttachmentPolicies'
             'ExoTransportRules'
             'ExoDkimSigningConfig'
             'ExoOrganizationConfig'
             'ExoAcceptedDomains'
             'ExoHostedContentFilterPolicy'
             'ExoHostedOutboundSpamFilterPolicy'
-            'ExoAtpPolicyForO365'
             'ExoQuarantinePolicy'
             'ExoRemoteDomain'
             'ExoSharingPolicy'
@@ -91,7 +106,22 @@ function Invoke-CIPPDBCacheCollection {
             'ExoProtectionAlert'
             'OwaMailboxPolicy'
             'ReportSubmissionPolicy'
+            'ReportSubmissionRule'
             'ExoTransportConfig'
+            'ExoHostedConnectionFilterPolicy'
+            'ExoExternalInOutlook'
+            'ExoOutboundConnector'
+            'ExoRoleAssignmentPolicy'
+            'ExoHostedContentFilterRule'
+            'ExoGlobalQuarantinePolicy'
+            'ExoOMEConfiguration'
+            'ExoMailboxPlans'
+            'ExoRetentionPolicyTags'
+            'ExoRetentionPolicies'
+            'ExoDynamicDistributionGroup'
+            'ExoMailContacts'
+            'ExoTenantAllowBlockListSpoofItems'
+            'ExoPhishSimConfig'
         )
         ExchangeData       = @(
             'CASMailboxes'
@@ -124,11 +154,22 @@ function Invoke-CIPPDBCacheCollection {
             'IntuneScripts'
             'IntuneReusableSettings'
             'DetectedApps'
+            'IntuneAppInstallStatus'
             'MDEOnboarding'
+            'AutopilotDeploymentProfiles'
+            'DeviceEnrollmentConfigurations'
+            'IntuneDeviceManagementSettings'
+            'IntuneDataProcessorOnboarding'
+            'IntuneBrandingProfile'
+            'ManagedDeviceCleanupRules'
         )
         Compliance         = @(
             'SensitivityLabels'
             'DlpCompliancePolicies'
+            'ComplianceRetentionPolicies'
+            'ComplianceRetentionRules'
+            'ExoDlpSensitiveInfoTypes'
+            'ExoLabels'
         )
         CopilotUsage       = @(
             'CopilotUsageUserDetail'
@@ -138,8 +179,11 @@ function Invoke-CIPPDBCacheCollection {
         )
         SharePoint         = @(
             'SPOTenant'
+            'SPOSites'
             'SPOTenantSyncClientRestriction'
+            'SharePointAdminSettings'
             'SharePointSiteUsage'
+            'SiteActivity'
             'OneDriveUsage'
         )
         Teams              = @(
@@ -148,10 +192,21 @@ function Invoke-CIPPDBCacheCollection {
             'CsExternalAccessPolicy'
             'CsTenantFederationConfiguration'
             'CsTeamsMessagingPolicy'
+            'CsTeamsMessagingConfiguration'
             'CsTeamsAppPermissionPolicy'
             'Teams'
             'TeamsActivity'
             'TeamsVoice'
+            'TeamsResourceAccounts'
+        )
+        Defender           = @(
+            'DefenderCVEs'
+        )
+        DefenderForOffice365 = @(
+            'ExoSafeLinksPolicies'
+            'ExoSafeAttachmentPolicies'
+            'ExoAtpPolicyForO365'
+            'ExoTeamsProtectionPolicy'
         )
     }
 
